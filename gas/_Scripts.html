@@ -1,0 +1,914 @@
+<script>
+/* ==========================================================================
+   SIMANEV PSSDM — Client Logic (Vanilla JS, mobile friendly)
+   Semua data diambil melalui google.script.run dari file WebAppApi.gs
+   ========================================================================== */
+(function () {
+  'use strict';
+
+  /* ---------------------------- STATE ---------------------------- */
+  var state = {
+    config: null,
+    events: [],
+    stats: null,
+    page: 'home',
+    activeEvent: null,
+    scanTimer: null,
+    scanning: false,
+    stream: null,
+    lastScanAt: 0
+  };
+
+  var view = document.getElementById('view');
+  var toastEl = document.getElementById('toast');
+
+  /* ---------------------- BRIDGE KE SERVER ----------------------- */
+  function api(fn) {
+    var args = Array.prototype.slice.call(arguments, 1);
+    return new Promise(function (resolve, reject) {
+      if (typeof google === 'undefined' || !google.script || !google.script.run) {
+        reject(new Error('Aplikasi harus dijalankan sebagai Web App Apps Script.'));
+        return;
+      }
+      var runner = google.script.run
+        .withSuccessHandler(resolve)
+        .withFailureHandler(function (err) {
+          reject(new Error(err && err.message ? err.message : 'Terjadi kesalahan pada server.'));
+        });
+      runner[fn].apply(runner, args);
+    });
+  }
+
+  /* --------------------------- UTILITAS -------------------------- */
+  function toast(msg, type) {
+    toastEl.textContent = msg;
+    toastEl.className = 'toast show ' + (type || '');
+    clearTimeout(toastEl._t);
+    toastEl._t = setTimeout(function () { toastEl.className = 'toast'; }, 3200);
+  }
+
+  function esc(value) {
+    return String(value === null || value === undefined ? '' : value)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function beep(ok) {
+    try {
+      var Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      var ctx = new Ctx();
+      var osc = ctx.createOscillator();
+      var gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = ok ? 880 : 240;
+      gain.gain.value = 0.08;
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.start();
+      setTimeout(function () { osc.stop(); ctx.close(); }, ok ? 130 : 320);
+    } catch (e) { /* abaikan */ }
+  }
+
+  function loading(label) {
+    view.innerHTML = '<div class="wrap loading-block"><div class="spinner"></div><p>' +
+      esc(label || 'Memuat data…') + '</p></div>';
+  }
+
+  function skeletons(n) {
+    var out = '<div class="wrap"><div class="grid g3">';
+    for (var i = 0; i < (n || 3); i++) out += '<div class="skeleton"></div>';
+    return out + '</div></div>';
+  }
+
+  function setNavActive(page) {
+    ['topNav', 'bottomNav'].forEach(function (id) {
+      var links = document.getElementById(id).querySelectorAll('a');
+      links.forEach(function (a) {
+        a.classList.toggle('active', a.getAttribute('data-nav') === page);
+      });
+    });
+    document.querySelector('.app-header').classList.remove('nav-open');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  /* ---------------------------- ROUTER --------------------------- */
+  function parseRoute() {
+    var raw = (location.hash || '').replace(/^#\/?/, '');
+    var bits = raw.split('?');
+    var path = bits[0].split('/').filter(Boolean);
+    var qs = {};
+    String(bits[1] || '').split('&').forEach(function (kv) {
+      if (!kv) return;
+      var p = kv.split('=');
+      qs[decodeURIComponent(p[0])] = decodeURIComponent(p[1] || '');
+    });
+    return { page: path[0] || 'home', param: path[1] || '', qs: qs };
+  }
+
+  function go(hash) { location.hash = hash; }
+
+  window.addEventListener('hashchange', route);
+
+  function route() {
+    var r = parseRoute();
+    state.page = r.page;
+    setNavActive(r.page === 'home' ? 'home' : r.page);
+    stopCamera();
+
+    switch (r.page) {
+      case 'events': return viewEvents();
+      case 'event': return viewEvent(r.param || r.qs.slug);
+      case 'register': return viewRegister();
+      case 'ticket': return viewTicket(r.qs.code);
+      case 'scan': return viewScan(r.qs.code);
+      case 'checkin': return viewCheckinAuto(r.qs.code);
+      case 'dashboard': return viewDashboard();
+      case 'admin': return viewDashboard();
+      default: return viewHome();
+    }
+  }
+
+  /* =========================== VIEW: PORTAL ====================== */
+  function viewHome() {
+    loading('Memuat portal event…');
+    api('apiGetHome').then(function (data) {
+      state.config = data.config;
+      state.stats = data.stats;
+      renderContact();
+      var upcoming = data.upcoming || [];
+      var html = '' +
+        '<section class="hero">' +
+          '<span class="badge">Portal Event Resmi</span>' +
+          '<h1>Manajemen Event<br/>SDM Kelautan &amp; Perikanan</h1>' +
+          '<p>' + esc(data.config.tagline) + '. Daftar online, dapatkan e-ticket &amp; QR Code otomatis, ' +
+            'dan lakukan check-in dengan sekali scan.</p>' +
+          '<div class="hero-actions">' +
+            '<a class="btn btn-amber" href="#/events">📅 Lihat Event</a>' +
+            '<a class="btn btn-outline" href="#/register">✍️ Daftar Peserta</a>' +
+          '</div>' +
+        '</section>' +
+
+        '<div class="grid g4" style="margin-bottom:22px">' +
+          statCard('📅', data.stats.totalEvents, 'Total Event', 'i-teal') +
+          statCard('👥', data.stats.totalParticipants, 'Peserta', 'i-amber') +
+          statCard('✅', data.stats.totalCheckedIn, 'Sudah Check-in', 'i-green') +
+          statCard('⏳', data.stats.totalPending, 'Belum Hadir', 'i-red') +
+        '</div>' +
+
+        '<div class="grid g3" style="margin-bottom:26px">' +
+          miniCard('📝', 'Pendaftaran Peserta', 'Formulir online dengan data peserta, instansi, dan jabatan.') +
+          miniCard('🎟️', 'QR &amp; E-Ticket Otomatis', 'Nomor tiket dan QR unik dibuat sistem, dikirim ke email.') +
+          miniCard('📷', 'Scan &amp; Validasi', 'Scan via kamera HP, kehadiran tervalidasi otomatis real-time.') +
+        '</div>' +
+
+        sectionHead('Event Mendatang', 'Kegiatan sertifikasi, seminar, dan pelatihan terdekat.', '#/events') +
+        (upcoming.length
+          ? '<div class="grid g3">' + upcoming.map(eventCard).join('') + '</div>'
+          : '<div class="empty"><div class="big">🗓️</div><p>Belum ada event mendatang.<br/>Gunakan menu <b>Alat Admin</b> untuk menambah data.</p></div>') +
+
+        (data.past && data.past.length
+          ? sectionHead('Event Sebelumnya', 'Riwayat kegiatan yang sudah dilaksanakan.', '#/events') +
+            '<div class="grid g3">' + data.past.map(eventCard).join('') + '</div>'
+          : '') +
+
+        '<div class="card card-lg" style="margin-top:26px;background:linear-gradient(120deg,#0f3d4a,#134e4a);color:#fff">' +
+          '<h3 style="color:#fff">Alur layanan peserta</h3>' +
+          '<ol class="steps" style="color:#dbeafe">' +
+            '<li>Pilih event dan isi formulir pendaftaran.</li>' +
+            '<li>Sistem membuat nomor tiket &amp; QR Code otomatis.</li>' +
+            '<li>E-ticket dikirim ke email peserta.</li>' +
+            '<li>Pada hari-H, petugas memindai QR peserta.</li>' +
+            '<li>Kehadiran tervalidasi otomatis &amp; tercatat di laporan.</li>' +
+          '</ol>' +
+          '<a class="btn btn-amber btn-block" href="#/register">Mulai Pendaftaran</a>' +
+        '</div>';
+      view.innerHTML = '<div class="wrap">' + html + '</div>';
+    }).catch(function (err) { errorBlock(err.message); });
+  }
+
+  /* =========================== VIEW: EVENTS ====================== */
+  function viewEvents() {
+    loading('Memuat daftar event…');
+    api('apiGetEvents').then(function (data) {
+      state.events = data.events || [];
+      var html = '' +
+        '<div class="hero" style="padding:26px 22px">' +
+          '<h1 style="font-size:24px">Daftar Event</h1>' +
+          '<p>Temukan kegiatan sertifikasi, seminar, dan pelatihan untuk peningkatan kompetensi SDM kelautan dan perikanan.</p>' +
+        '</div>';
+      if (!state.events.length) {
+        html += '<div class="empty"><div class="big">📭</div><p>Belum ada event.<br/>Buka <b>Dashboard → Alat Admin → Isi Data Contoh</b>.</p></div>';
+      } else {
+        html += '<div class="grid g3">' + state.events.map(eventCard).join('') + '</div>';
+      }
+      view.innerHTML = '<div class="wrap">' + html + '</div>';
+    }).catch(function (err) { errorBlock(err.message); });
+  }
+
+  /* ====================== VIEW: DETAIL + DAFTAR ================== */
+  function viewEvent(slug) {
+    if (!slug) return viewEvents();
+    loading('Memuat detail event…');
+    api('apiGetEvent', slug).then(function (data) {
+      if (!data.ok) { errorBlock(data.message); return; }
+      state.activeEvent = data.event;
+      var e = data.event;
+      var html = '' +
+        '<div class="detail-hero">' +
+          '<img src="' + esc(e.imageUrl || '') + '" alt=""/>' +
+          '<div class="overlay"></div>' +
+          '<div class="content">' +
+            '<span class="badge badge-amber">' + esc(e.category) + '</span>' +
+            '<h1>' + esc(e.title) + '</h1>' +
+            '<div class="event-meta" style="margin-top:10px">' +
+              chip('📅', e.dateShort) + chip('⏰', e.startTime + '–' + e.endTime) + chip('📍', esc(e.city)) +
+            '</div>' +
+          '</div>' +
+        '</div>' +
+
+        '<div class="detail-layout">' +
+          '<div>' +
+            '<div class="card card-lg">' +
+              '<h2>Tentang Event</h2>' +
+              '<p>' + esc(e.description) + '</p>' +
+              (e.info ? '<p class="muted">' + esc(e.info) + '</p>' : '') +
+              '<div class="info-grid">' +
+                infoItem('Tanggal', e.dateLong) +
+                infoItem('Waktu', e.startTime + ' – ' + e.endTime) +
+                infoItem('Tempat', esc(e.venue)) +
+                infoItem('Kota', esc(e.city)) +
+                infoItem('Kuota', e.maxParticipants + ' peserta') +
+                infoItem('Sisa Kursi', data.seatsLeft) +
+                infoItem('Terdaftar', data.registered + ' peserta') +
+                infoItem('Status', e.badge) +
+              '</div>' +
+              (e.bloggerUrl ? '<p class="muted">Dipublikasikan di Blogger: <a href="' + esc(e.bloggerUrl) + '" target="_blank">lihat postingan</a></p>' : '') +
+            '</div>' +
+            '<div class="card card-lg" style="margin-top:16px;background:linear-gradient(120deg,#0f3d4a,#134e4a);color:#fff">' +
+              '<h3 style="color:#fff">Manfaat peserta</h3>' +
+              '<ul class="benefit-list">' +
+                '<li>Sertifikat kompetensi yang diakui nasional.</li>' +
+                '<li>Materi dari asesor dan praktisi berpengalaman.</li>' +
+                '<li>Jejaring profesional sektor kelautan &amp; perikanan.</li>' +
+                '<li>E-ticket digital dengan QR Code pribadi.</li>' +
+              '</ul>' +
+            '</div>' +
+          '</div>' +
+
+          '<aside class="card card-lg">' +
+            '<h3>Pendaftaran Peserta</h3>' +
+            '<p class="muted">Isi data diri. E-ticket &amp; QR Code dibuat otomatis.</p>' +
+            (e.isOpen
+              ? renderForm(e)
+              : '<div class="empty"><div class="big">🔒</div><p>Pendaftaran event ini sudah ditutup.</p></div>') +
+          '</aside>' +
+        '</div>';
+      view.innerHTML = '<div class="wrap">' + html + '</div>';
+      bindForm();
+    }).catch(function (err) { errorBlock(err.message); });
+  }
+
+  /* ======================== VIEW: PILIH EVENT ==================== */
+  function viewRegister() {
+    loading('Menyiapkan formulir…');
+    api('apiGetEvents').then(function (data) {
+      state.events = data.events || [];
+      var open = state.events.filter(function (e) { return e.isOpen; });
+      var html = '' +
+        '<div class="hero" style="padding:26px 22px">' +
+          '<h1 style="font-size:24px">Pendaftaran Peserta</h1>' +
+          '<p>Pilih event, lengkapi data diri, dan langsung dapatkan e-ticket beserta QR Code.</p>' +
+        '</div>';
+      if (!open.length) {
+        html += '<div class="empty"><div class="big">🚫</div><p>Belum ada event yang membuka pendaftaran.</p></div>';
+      } else {
+        html += '<div class="card card-lg">' +
+          '<div class="field"><label for="f-event">Pilih Event <span class="req">*</span></label>' +
+            '<select id="f-event">' +
+              open.map(function (e) {
+                return '<option value="' + esc(e.id) + '">' + esc(e.title) + ' — ' + esc(e.dateShort) + '</option>';
+              }).join('') +
+            '</select></div>' +
+          renderForm(null) + '</div>';
+      }
+      view.innerHTML = '<div class="wrap">' + html + '</div>';
+      bindForm();
+      var sel = document.getElementById('f-event');
+      if (sel) sel.addEventListener('change', function () {
+        state.activeEvent = state.events.filter(function (e) { return String(e.id) === sel.value; })[0] || null;
+      });
+    }).catch(function (err) { errorBlock(err.message); });
+  }
+
+  /* -------------------- RENDER & SUBMIT FORMULIR ---------------- */
+  function renderForm(event) {
+    return '' +
+      '<form id="regForm" novalidate>' +
+        '<div class="field"><label for="f-name">Nama Lengkap <span class="req">*</span></label>' +
+          '<input id="f-name" required placeholder="Nama lengkap beserta gelar"/></div>' +
+        '<div class="form-grid two">' +
+          '<div class="field"><label for="f-email">Email <span class="req">*</span></label>' +
+            '<input id="f-email" type="email" required placeholder="nama@instansi.go.id"/></div>' +
+          '<div class="field"><label for="f-phone">No. HP / WhatsApp</label>' +
+            '<input id="f-phone" inputmode="tel" placeholder="08xxxxxxxxxx"/></div>' +
+        '</div>' +
+        '<div class="form-grid two">' +
+          '<div class="field"><label for="f-org">Instansi / Organisasi</label>' +
+            '<input id="f-org" placeholder="Kementerian Kelautan dan Perikanan"/></div>' +
+          '<div class="field"><label for="f-pos">Jabatan</label>' +
+            '<input id="f-pos" placeholder="Kepala Subdirektorat"/></div>' +
+        '</div>' +
+        '<div class="field"><label for="f-addr">Alamat</label>' +
+          '<textarea id="f-addr" placeholder="Alamat domisili/instansi"></textarea></div>' +
+        '<input type="hidden" id="f-eventId" value="' + esc(event ? event.id : '') + '"/>' +
+        '<button class="btn btn-primary btn-block" type="submit" id="regSubmit">✍️ Daftar &amp; Buat E-Ticket</button>' +
+        '<p class="form-note">🔒 Data peserta tersimpan pada Google Spreadsheet milik instansi.</p>' +
+      '</form>';
+  }
+
+  function bindForm() {
+    var form = document.getElementById('regForm');
+    if (!form) return;
+    form.addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var eventId = (document.getElementById('f-eventId') || {}).value;
+      var select = document.getElementById('f-event');
+      if (select && !eventId) eventId = select.value;
+      if (!eventId) { toast('Pilih event terlebih dahulu.', 'err'); return; }
+
+      var payload = {
+        eventId: eventId,
+        fullName: val('f-name'), email: val('f-email'), phone: val('f-phone'),
+        organization: val('f-org'), position: val('f-pos'), address: val('f-addr')
+      };
+      if (!payload.fullName) { toast('Nama lengkap wajib diisi.', 'err'); return; }
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(payload.email)) { toast('Format email tidak valid.', 'err'); return; }
+
+      var btn = document.getElementById('regSubmit');
+      btn.disabled = true; btn.textContent = '⏳ Memproses pendaftaran…';
+
+      api('apiRegister', payload).then(function (res) {
+        if (!res.ok) { toast(res.message, 'err'); resetBtn(btn); return; }
+        toast(res.message, 'ok');
+        renderTicketPage(res.ticket, res.message, res.emailStatus);
+      }).catch(function (err) {
+        toast(err.message, 'err'); resetBtn(btn);
+      });
+    });
+  }
+
+  function val(id) { var el = document.getElementById(id); return el ? el.value.trim() : ''; }
+  function resetBtn(btn) { btn.disabled = false; btn.textContent = '✍️ Daftar & Buat E-Ticket'; }
+
+  /* =========================== VIEW: TIKET ======================= */
+  function viewTicket(code) {
+    var html = '' +
+      '<div class="hero" style="padding:26px 22px">' +
+        '<h1 style="font-size:24px">Cek E-Ticket Peserta</h1>' +
+        '<p>Masukkan nomor tiket atau kode QR Anda untuk melihat/mencetak ulang e-ticket.</p>' +
+      '</div>' +
+      '<div class="card card-lg" style="max-width:640px;margin:0 auto">' +
+        '<form id="ticketForm">' +
+          '<div class="field"><label for="t-code">Nomor Tiket / Kode QR</label>' +
+            '<input id="t-code" placeholder="TIC-0001-0001 atau PSSDM-XXXXXXXX"/></div>' +
+          '<button class="btn btn-primary btn-block" type="submit">🎟️ Cari Tiket</button>' +
+        '</form>' +
+      '</div>' +
+      '<div id="ticketResult" style="margin-top:20px"></div>';
+    view.innerHTML = '<div class="wrap">' + html + '</div>';
+
+    if (code) {
+      var input = document.getElementById('t-code');
+      if (input) { input.value = code; submitTicket(code); }
+    }
+    document.getElementById('ticketForm').addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var value = val('t-code');
+      if (!value) { toast('Masukkan nomor tiket atau kode QR.', 'err'); return; }
+      submitTicket(value);
+    });
+  }
+
+  function submitTicket(code) {
+    var box = document.getElementById('ticketResult');
+    box.innerHTML = '<div class="loading-block"><div class="spinner"></div><p>Mencari tiket…</p></div>';
+    api('apiGetTicket', code).then(function (res) {
+      if (!res.ok) {
+        box.innerHTML = '<div class="result err"><div class="mark">⚠️</div><div>' +
+          '<h4>Tiket tidak ditemukan</h4><p>' + esc(res.message) + '</p></div></div>';
+        return;
+      }
+      renderTicketPage(res.ticket, 'Tiket ditemukan.', null, box);
+    }).catch(function (err) {
+      box.innerHTML = '<div class="result err"><div class="mark">⚠️</div><div><h4>Kesalahan</h4><p>' +
+        esc(err.message) + '</p></div></div>';
+    });
+  }
+
+  function renderTicketPage(ticket, message, emailStatus, container) {
+    var html = '' +
+      (message ? '<div class="result ok" style="max-width:520px;margin:0 auto 18px"><div class="mark">✅</div><div>' +
+        '<h4>' + esc(message) + '</h4>' +
+        (emailStatus ? '<p>Status e-ticket email: ' + esc(emailStatus) + '</p>' : '') +
+        '</div></div>' : '') +
+      ticketHtml(ticket);
+    if (container) { container.innerHTML = html; window.scrollTo({ top: 0, behavior: 'smooth' }); return; }
+    view.innerHTML = '<div class="wrap">' + html +
+      '<div class="center" style="margin-top:18px">' +
+        '<a class="btn btn-ghost btn-sm" href="#/ticket">🔄 Cari tiket lain</a> ' +
+        '<a class="btn btn-ghost btn-sm" href="#/events">📅 Event lain</a>' +
+      '</div></div>';
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  function ticketHtml(t) {
+    var r = t.registration, p = t.participant || {}, e = t.event || {};
+    var ok = t.checkedIn;
+    return '' +
+      '<div class="ticket">' +
+        '<div class="ticket-top">' +
+          '<div class="kicker">E-Ticket Peserta · ' + esc(r.ticketNumber) + '</div>' +
+          '<h3>' + esc(e.title || '') + '</h3>' +
+          '<div class="sub">' + esc(e.dateShort + ' · ' + e.startTime + ' · ' + (e.venue || '')) + '</div>' +
+        '</div>' +
+        '<div class="ticket-mid">' +
+          trow('Nama Peserta', esc(p.fullName)) +
+          trow('Email', esc(p.email)) +
+          trow('Instansi', esc(p.organization || '-')) +
+          trow('Jabatan', esc(p.position || '-')) +
+          trow('No. HP', esc(p.phone || '-')) +
+          trow('Tempat', esc((e.venue || '-') + (e.city ? ', ' + e.city : ''))) +
+          trow('Tanggal', esc(e.dateLong)) +
+          '<div class="ticket-qr">' +
+            '<img src="' + esc(t.qrUrl) + '" alt="QR Code"/>' +
+            '<div class="ticket-code">' + esc(r.qrCode) + '</div>' +
+            '<p class="muted" style="margin:6px 0 0">Tunjukkan QR ini kepada petugas check-in</p>' +
+            '<button class="btn btn-ghost btn-sm" style="margin-top:12px" onclick="window.print()">🖨️ Cetak / Simpan PDF</button>' +
+          '</div>' +
+        '</div>' +
+        '<div class="ticket-status" style="background:' + (ok ? '#059669' : '#f59e0b') + '">' +
+          (ok ? 'SUDAH CHECK-IN · ' + esc(t.checkedInLong) : 'BELUM CHECK-IN · TIKET AKTIF') +
+        '</div>' +
+      '</div>';
+  }
+
+  function trow(label, value) {
+    return '<div class="ticket-row"><span>' + label + '</span><strong>' + value + '</strong></div>';
+  }
+
+  /* ============================ VIEW: SCAN ======================= */
+  function viewScan(prefill) {
+    var html = '' +
+      '<div class="hero" style="padding:26px 22px">' +
+        '<h1 style="font-size:24px">Scan QR — Check-in</h1>' +
+        '<p>ARAHKAN kamera ke QR Code peserta. Sistem memvalidasi tiket &amp; mencatat kehadiran otomatis.</p>' +
+      '</div>' +
+      '<div class="card card-lg">' +
+        '<h3>1. Scan dengan kamera</h3>' +
+        '<div class="scan-frame" id="scanFrame">' +
+          '<div class="scan-idle" id="scanIdle"><div class="big">📷</div>' +
+            '<p id="camHint">Tekan tombol di bawah untuk mengaktifkan kamera</p></div>' +
+          '<video id="video" playsinline muted style="display:none"></video>' +
+          '<div class="scan-overlay" id="scanOverlay" style="display:none"></div>' +
+        '</div>' +
+        '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:14px">' +
+          '<button class="btn btn-primary" id="btnCam">▶️ Aktifkan Kamera</button>' +
+          '<button class="btn btn-danger" id="btnStop" style="display:none">⏹️ Stop</button>' +
+          '<button class="btn btn-ghost" id="btnManual">⌨️ Input Manual</button>' +
+        '</div>' +
+        '<p class="muted" id="scanNote" style="margin-top:10px"></p>' +
+      '</div>' +
+
+      '<div class="card card-lg" style="margin-top:16px">' +
+        '<h3>2. Input manual / scanner USB</h3>' +
+        '<p class="muted">Cocok untuk barcode scanner USB atau bila kamera tidak tersedia.</p>' +
+        '<form id="scanForm">' +
+          '<div class="field"><label for="s-code">Kode QR / Nomor Tiket</label>' +
+            '<input id="s-code" autocomplete="off" placeholder="PSSDM-XXXXXXXX atau TIC-0001-0001"/></div>' +
+          '<button class="btn btn-amber btn-block" type="submit">✅ Proses Check-in</button>' +
+        '</form>' +
+      '</div>' +
+
+      '<div id="scanResult" style="margin-top:18px"></div>' +
+      '<div class="card card-lg" style="margin-top:16px">' +
+        '<h3>Riwayat scan terakhir</h3>' +
+        '<div id="recentBox">' +
+          '<div class="loading-block"><div class="spinner"></div></div>' +
+        '</div>' +
+      '</div>';
+
+    view.innerHTML = '<div class="wrap">' + html + '</div>';
+
+    document.getElementById('btnCam').addEventListener('click', startCamera);
+    document.getElementById('btnStop').addEventListener('click', stopCamera);
+    document.getElementById('btnManual').addEventListener('click', function () {
+      document.getElementById('s-code').focus();
+    });
+    document.getElementById('scanForm').addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var code = val('s-code');
+      if (!code) { toast('Masukkan kode QR terlebih dahulu.', 'err'); return; }
+      doCheckIn(code);
+    });
+
+    loadRecent();
+    if (prefill) {
+      document.getElementById('s-code').value = prefill;
+      doCheckIn(prefill);
+    }
+  }
+
+  /* ------------------------ KAMERA + DETEKSI --------------------- */
+  function startCamera() {
+    var hint = document.getElementById('camHint');
+    if (!('BarcodeDetector' in window)) {
+      hint.innerHTML = 'Browser ini tidak mendukung deteksi QR otomatis.<br/>' +
+        'Gunakan <b>Chrome/Edge Android atau Chrome desktop</b>, atau pakai <b>Input Manual</b>.';
+      toast('Deteksi QR otomatis tidak didukung. Gunakan input manual.', 'err');
+      return;
+    }
+    navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
+      .then(function (stream) {
+        state.stream = stream;
+        state.scanning = true;
+        var video = document.getElementById('video');
+        video.srcObject = stream;
+        video.style.display = 'block';
+        document.getElementById('scanIdle').style.display = 'none';
+        document.getElementById('scanOverlay').style.display = 'block';
+        document.getElementById('btnStop').style.display = 'inline-flex';
+        document.getElementById('btnCam').style.display = 'none';
+        document.getElementById('scanNote').textContent = 'Kamera aktif — arahkan QR ke dalam kotak kuning.';
+        return video.play().then(function () { detectLoop(video); });
+      })
+      .catch(function () {
+        hint.innerHTML = 'Tidak dapat mengakses kamera.<br/>Pastikan izin kamera diberikan lalu coba lagi.';
+        toast('Izin kamera ditolak.', 'err');
+      });
+  }
+
+  function stopCamera() {
+    state.scanning = false;
+    if (state.stream) {
+      state.stream.getTracks().forEach(function (t) { t.stop(); });
+      state.stream = null;
+    }
+    var video = document.getElementById('video');
+    if (video) { video.style.display = 'none'; video.srcObject = null; }
+    var idle = document.getElementById('scanIdle');
+    if (idle) idle.style.display = 'block';
+    var overlay = document.getElementById('scanOverlay');
+    if (overlay) overlay.style.display = 'none';
+    var btnCam = document.getElementById('btnCam');
+    if (btnCam) btnCam.style.display = 'inline-flex';
+    var btnStop = document.getElementById('btnStop');
+    if (btnStop) btnStop.style.display = 'none';
+    var note = document.getElementById('scanNote');
+    if (note) note.textContent = '';
+  }
+
+  function detectLoop(video) {
+    if (!state.scanning) return;
+    var detector = new BarcodeDetector({ formats: ['qr_code'] });
+    detector.detect(video).then(function (codes) {
+      if (codes && codes.length && Date.now() - state.lastScanAt > 2200) {
+        state.lastScanAt = Date.now();
+        var value = codes[0].rawValue;
+        document.getElementById('s-code').value = value;
+        doCheckIn(value);
+      }
+    }).catch(function () { /* abaikan frame gagal */ });
+    requestAnimationFrame(function () { detectLoop(video); });
+  }
+
+  /* -------------------------- PROSES CHECK-IN -------------------- */
+  function doCheckIn(code) {
+    var box = document.getElementById('scanResult');
+    if (box) box.innerHTML = '<div class="loading-block"><div class="spinner"></div><p>Memvalidasi tiket…</p></div>';
+    api('apiCheckIn', code, 'Petugas Check-in (Web)').then(function (res) {
+      beep(res.ok && !res.duplicate);
+      renderCheckInResult(res);
+      loadRecent();
+      var input = document.getElementById('s-code');
+      if (input) { input.value = ''; input.focus(); }
+    }).catch(function (err) {
+      beep(false);
+      if (box) box.innerHTML = resultBlock('err', '⚠️', 'Kesalahan', err.message, null);
+    });
+  }
+
+  function renderCheckInResult(res) {
+    var t = res.ticket;
+    var kind = res.ok ? (res.duplicate ? 'warn' : 'ok') : 'err';
+    var title = res.ok ? (res.duplicate ? 'Sudah Check-in Sebelumnya' : 'Check-in Berhasil') : 'Check-in Ditolak';
+    var icon = res.ok ? (res.duplicate ? '⚠️' : '✅') : '⛔';
+    var extra = '';
+    if (t) {
+      extra = personBlock(t) +
+        '<div class="ticket-row"><span>No. Tiket</span><strong>' + esc(t.registration.ticketNumber) + '</strong></div>' +
+        '<div class="ticket-row"><span>Event</span><strong>' + esc(t.event.title) + '</strong></div>' +
+        (t.checkedIn
+          ? '<div class="ticket-row"><span>Waktu Check-in</span><strong>' + esc(t.checkedInLong) + '</strong></div>'
+          : '');
+    }
+    document.getElementById('scanResult').innerHTML =
+      '<div class="result ' + kind + '"><div class="mark">' + icon + '</div><div style="flex:1">' +
+        '<h4>' + esc(title) + '</h4><p>' + esc(res.message) + '</p>' + extra +
+      '</div></div>';
+  }
+
+  function resultBlock(kind, icon, title, message, extra) {
+    return '<div class="result ' + kind + '"><div class="mark">' + icon + '</div><div style="flex:1">' +
+      '<h4>' + esc(title) + '</h4><p>' + esc(message) + '</p>' + (extra || '') + '</div></div>';
+  }
+
+  function personBlock(t) {
+    return '<div class="person"><div class="avatar">' + esc(t.initials) + '</div><div>' +
+      '<div class="nm">' + esc(t.participant.fullName) + '</div>' +
+      '<div class="org">' + esc(t.participant.organization || '-') + '</div></div></div>';
+  }
+
+  function loadRecent() {
+    var box = document.getElementById('recentBox');
+    if (!box) return;
+    api('apiRecentCheckins', 12).then(function (res) {
+      var rows = (res.recent || []);
+      if (!rows.length) { box.innerHTML = '<p class="muted">Belum ada aktivitas scan.</p>'; return; }
+      var map = { SUCCESS: ['green', 'Berhasil'], DUPLICATE: ['amber', 'Duplikat'],
+        NOT_FOUND: ['red', 'Tidak dikenal'], CANCELLED: ['red', 'Dibatalkan'],
+        TOO_EARLY: ['amber', 'Terlalu awal'] };
+      box.innerHTML = '<div class="table-wrap"><table class="data"><thead><tr>' +
+        '<th>Waktu</th><th>Peserta</th><th>Tiket</th><th class="c">Hasil</th></tr></thead><tbody>' +
+        rows.map(function (r) {
+          var m = map[r.result] || ['slate', r.result];
+          var time = r.scannedAt ? new Date(r.scannedAt.replace(/-/g, '/')) : new Date();
+          return '<tr><td>' + time.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }) + '</td>' +
+            '<td>' + esc(r.participantName) + '</td>' +
+            '<td>' + esc(r.ticketNumber) + '</td>' +
+            '<td class="c"><span class="pill ' + m[0] + '">' + m[1] + '</span></td></tr>';
+        }).join('') + '</tbody></table></div>';
+    }).catch(function () { box.innerHTML = '<p class="muted">Riwayat tidak tersedia.</p>'; });
+  }
+
+  /* =================== VIEW: CHECK-IN OTOMATIS DARI QR =========== */
+  function viewCheckinAuto(code) {
+    if (!code) return viewScan();
+    state.page = 'scan';
+    viewScan(code);
+  }
+
+  /* ======================= VIEW: DASHBOARD ======================= */
+  function viewDashboard() {
+    loading('Memuat dashboard & laporan…');
+    api('apiGetDashboard').then(function (data) {
+      state.stats = data.stats;
+      var s = data.stats;
+      var html = '' +
+        '<div class="hero" style="padding:26px 22px">' +
+          '<h1 style="font-size:24px">Dashboard &amp; Laporan Event</h1>' +
+          '<p>Statistik pendaftaran, tingkat kehadiran, riwayat scan, dan alat kelola event.</p>' +
+        '</div>' +
+
+        '<div class="grid g4" style="margin-bottom:22px">' +
+          statCard('📅', s.totalEvents, 'Event', 'i-teal') +
+          statCard('👥', s.totalParticipants, 'Peserta', 'i-amber') +
+          statCard('✅', s.totalCheckedIn, 'Sudah Hadir', 'i-green') +
+          statCard('📈', s.attendanceRate + '%', 'Tingkat Hadir', 'i-teal') +
+        '</div>' +
+
+        '<div class="tabs">' +
+          '<button class="tab-btn active" data-tab="rekap">📊 Rekap Event</button>' +
+          '<button class="tab-btn" data-tab="peserta">👥 Data Peserta</button>' +
+          '<button class="tab-btn" data-tab="riwayat">🕓 Riwayat Scan</button>' +
+          '<button class="tab-btn" data-tab="alat">🛠️ Alat Admin</button>' +
+        '</div>' +
+        '<div id="tabBody"></div>';
+
+      view.innerHTML = '<div class="wrap">' + html + '</div>';
+
+      var events = data.events || [];
+      var recent = data.recent || [];
+      var bodies = {
+        rekap: rekapHtml(events),
+        peserta: '<div class="card card-lg"><p class="muted">Pilih event untuk melihat daftar peserta.</p>' +
+          '<div class="field"><label for="p-event">Event</label><select id="p-event">' +
+          events.map(function (e) { return '<option value="' + esc(e.id) + '">' + esc(e.title) + '</option>'; }).join('') +
+          '</select></div><div id="p-body"><p class="muted">Menunggu pilihan event…</p></div></div>',
+        riwayat: '<div class="card card-lg">' + recentTable(recent) + '</div>',
+        alat: alatHtml()
+      };
+
+      function showTab(name) {
+        document.querySelectorAll('.tab-btn').forEach(function (b) {
+          b.classList.toggle('active', b.getAttribute('data-tab') === name);
+        });
+        document.getElementById('tabBody').innerHTML = bodies[name];
+        if (name === 'peserta') bindParticipantLoader();
+        if (name === 'alat') bindAdminTools();
+      }
+
+      document.querySelectorAll('.tab-btn').forEach(function (b) {
+        b.addEventListener('click', function () { showTab(b.getAttribute('data-tab')); });
+      });
+      showTab('rekap');
+    }).catch(function (err) { errorBlock(err.message); });
+  }
+
+  function rekapHtml(events) {
+    if (!events.length) return '<div class="empty"><div class="big">📭</div><p>Belum ada event. ' +
+      'Buka tab <b>Alat Admin</b> lalu klik <b>Isi Data Contoh</b>.</p></div>';
+    return '<div class="card card-lg"><div class="table-wrap"><table class="data">' +
+      '<thead><tr><th>Event</th><th>Tanggal</th><th class="c">Kuota</th><th class="c">Terdaftar</th>' +
+      '<th class="c">Hadir</th><th class="c">Belum</th><th class="c">Tingkat</th><th class="c">Status</th></tr></thead><tbody>' +
+      events.map(function (e) {
+        return '<tr>' +
+          '<td><a href="#/event/' + esc(e.slug) + '"><b>' + esc(e.title) + '</b></a>' +
+            '<div class="muted">' + esc(e.venue) + (e.city ? ', ' + esc(e.city) : '') + '</div></td>' +
+          '<td>' + esc(e.dateShort) + '</td>' +
+          '<td class="c">' + e.quota + '</td>' +
+          '<td class="c"><b>' + e.registered + '</b></td>' +
+          '<td class="c" style="color:#059669;font-weight:800">' + e.checkedIn + '</td>' +
+          '<td class="c" style="color:#b45309;font-weight:800">' + e.pending + '</td>' +
+          '<td class="c"><span class="bar"><i style="width:' + e.rate + '%"></i></span> <b>' + e.rate + '%</b></td>' +
+          '<td class="c"><span class="pill ' + (e.status === 'open' ? 'green' : 'slate') + '">' +
+            (e.status === 'open' ? 'Dibuka' : (e.status === 'done' ? 'Selesai' : 'Ditutup')) + '</span></td>' +
+        '</tr>';
+      }).join('') + '</tbody></table></div></div>';
+  }
+
+  function recentTable(recent) {
+    if (!recent || !recent.length) return '<p class="muted">Belum ada aktivitas scan.</p>';
+    var map = { SUCCESS: ['green', 'Berhasil'], DUPLICATE: ['amber', 'Duplikat'],
+      NOT_FOUND: ['red', 'Tidak dikenal'], CANCELLED: ['red', 'Dibatalkan'], TOO_EARLY: ['amber', 'Terlalu awal'] };
+    return '<div class="table-wrap"><table class="data"><thead><tr><th>Waktu</th><th>Peserta</th>' +
+      '<th>Tiket</th><th>Petugas</th><th class="c">Hasil</th></tr></thead><tbody>' +
+      recent.map(function (r) {
+        var m = map[r.result] || ['slate', r.result];
+        var d = r.scannedAt ? new Date(r.scannedAt.replace(/-/g, '/')) : new Date();
+        return '<tr><td>' + d.toLocaleString('id-ID') + '</td><td>' + esc(r.participantName) + '</td>' +
+          '<td>' + esc(r.ticketNumber) + '</td><td>' + esc(r.scannerName) + '</td>' +
+          '<td class="c"><span class="pill ' + m[0] + '">' + m[1] + '</span></td></tr>';
+      }).join('') + '</tbody></table></div>';
+  }
+
+  function alatHtml() {
+    return '<div class="grid g2">' +
+      '<div class="card"><h3>🧾 Database</h3><p class="muted">Buat/perbaiki struktur sheet database.</p>' +
+        '<button class="btn btn-primary btn-block" data-admin="setupDatabase">Setup Database</button></div>' +
+      '<div class="card"><h3>🌱 Data Contoh</h3><p class="muted">Isi 3 event + peserta demo (satu sudah check-in).</p>' +
+        '<button class="btn btn-primary btn-block" data-admin="seedSampleData">Isi Data Contoh</button></div>' +
+      '<div class="card"><h3>📣 Blogger</h3><p class="muted">Publikasikan semua event ke blog Blogger.</p>' +
+        '<button class="btn btn-amber btn-block" data-admin="syncEventsToBlogger">Publikasikan ke Blogger</button></div>' +
+      '<div class="card"><h3>📊 Laporan</h3><p class="muted">Buat sheet rekap kehadiran di Spreadsheet.</p>' +
+        '<button class="btn btn-primary btn-block" data-admin="createReportSheet">Buat Laporan</button></div>' +
+    '</div>' +
+    '<div class="card card-lg" style="margin-top:16px"><h3>🔑 Konfigurasi</h3>' +
+      '<p class="muted">Lengkapi <code>APP_CONFIG</code> pada file <code>Config.gs</code>: ' +
+      '<b>SPREADSHEET_ID</b>, <b>BLOG_ID</b>, <b>BLOG_URL</b>, dan <b>APP_URL</b> (URL /exec hasil deploy).</p>' +
+      '<p class="muted">Endpoint JSON API (dipakai gadget Blogger / scanner eksternal):</p>' +
+      '<pre style="background:#0f172a;color:#a5f3fc;padding:14px;border-radius:12px;overflow:auto;font-size:12px">' +
+        'POST {APP_URL}\n' +
+        '{ "action": "publicEvents" }\n' +
+        '{ "action": "checkin", "code": "PSSDM-XXXXXXXX", "scanner": "Petugas 1" }\n' +
+        '{ "action": "ticket", "code": "TIC-0001-0001" }\n' +
+      '</pre></div>';
+  }
+
+  function bindAdminTools() {
+    document.querySelectorAll('[data-admin]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var fn = btn.getAttribute('data-admin');
+        var label = btn.textContent;
+        btn.disabled = true; btn.textContent = '⏳ Memproses…';
+        api(fn).then(function (res) {
+          btn.disabled = false; btn.textContent = label;
+          var msg = 'Perintah selesai.';
+          if (res && res.published !== undefined) {
+            msg = 'Dibuat: ' + res.published + ' · Diperbarui: ' + res.updated + ' · Gagal: ' + res.failed +
+              (res.errors && res.errors.length ? '\n' + res.errors.join('\n') : '');
+          } else if (res && res.events !== undefined) {
+            msg = 'Event: ' + res.events + ' · Peserta: ' + res.participants + ' · Pendaftaran: ' + res.registrations;
+          } else if (res && res.spreadsheetId) {
+            msg = 'Spreadsheet ID: ' + res.spreadsheetId;
+          }
+          toast(msg, 'ok');
+        }).catch(function (err) {
+          btn.disabled = false; btn.textContent = label;
+          toast(err.message, 'err');
+        });
+      });
+    });
+  }
+
+  function bindParticipantLoader() {
+    var sel = document.getElementById('p-event');
+    if (!sel) return;
+    function load() {
+      var body = document.getElementById('p-body');
+      body.innerHTML = '<div class="loading-block"><div class="spinner"></div></div>';
+      api('apiEventParticipants', sel.value).then(function (res) {
+        var list = res.participants || [];
+        if (!list.length) { body.innerHTML = '<p class="muted">Belum ada peserta pada event ini.</p>'; return; }
+        body.innerHTML = '<div class="table-wrap"><table class="data"><thead><tr>' +
+          '<th>Peserta</th><th>Tiket</th><th class="c">QR</th><th class="c">Status</th><th>Check-in</th></tr></thead><tbody>' +
+          list.map(function (p) {
+            return '<tr>' +
+              '<td><b>' + esc(p.fullName) + '</b><div class="muted">' + esc(p.organization || '-') + '</div></td>' +
+              '<td>' + esc(p.ticketNumber) + '</td>' +
+              '<td class="c"><img src="' + esc(p.ticketUrl) + '" width="46" height="46" alt="qr"/></td>' +
+              '<td class="c"><span class="pill ' + (p.status === 'checked_in' ? 'green' : 'amber') + '">' +
+                (p.status === 'checked_in' ? 'Hadir' : 'Belum') + '</span></td>' +
+              '<td>' + esc(p.checkedInAt ? new Date(p.checkedInAt.replace(/-/g, '/')).toLocaleString('id-ID') : '-') + '</td>' +
+            '</tr>';
+          }).join('') + '</tbody></table></div>';
+      }).catch(function (err) { body.innerHTML = '<p class="muted">' + esc(err.message) + '</p>'; });
+    }
+    sel.addEventListener('change', load);
+    load();
+  }
+
+  /* ------------------------- KOMPONEN KECIL ---------------------- */
+  function statCard(icon, value, label, cls) {
+    return '<div class="stat"><div class="ico ' + cls + '">' + icon + '</div>' +
+      '<div class="val">' + esc(value) + '</div><div class="lbl">' + esc(label) + '</div></div>';
+  }
+
+  function miniCard(icon, title, desc) {
+    return '<div class="card"><div style="font-size:26px;margin-bottom:8px">' + icon + '</div>' +
+      '<h3 style="font-size:16px">' + title + '</h3><p class="muted" style="margin:0">' + desc + '</p></div>';
+  }
+
+  function eventCard(e) {
+    return '<article class="card event-card">' +
+      '<div class="event-thumb">' +
+        (e.imageUrl ? '<img src="' + esc(e.imageUrl) + '" alt=""/>' : '') +
+        '<span class="badge">' + esc(e.category) + '</span>' +
+        '<span class="badge right">' + esc(e.badge) + '</span>' +
+      '</div>' +
+      '<div class="event-body">' +
+        '<div class="event-meta">' + chip('📅', e.dateShort) + chip('📍', esc(e.city)) + '</div>' +
+        '<h3 class="event-title"><a href="#/event/' + esc(e.slug) + '">' + esc(e.title) + '</a></h3>' +
+        '<p class="event-desc">' + esc(e.description) + '</p>' +
+        '<div class="event-foot"><span>' + esc(e.venue) + '</span>' +
+          '<a class="btn btn-sm btn-primary" href="#/event/' + esc(e.slug) + '">Detail →</a></div>' +
+      '</div></article>';
+  }
+
+  function chip(icon, text) {
+    return '<span class="meta-chip">' + icon + ' ' + esc(text) + '</span>';
+  }
+
+  function infoItem(label, value) {
+    return '<div class="info-item"><span>' + esc(label) + '</span><strong>' + esc(value) + '</strong></div>';
+  }
+
+  function sectionHead(title, subtitle, moreHref) {
+    return '<div class="section-head"><div><h2>' + title + '</h2><p>' + esc(subtitle) + '</p></div>' +
+      (moreHref ? '<a href="' + moreHref + '">Lihat semua →</a>' : '') + '</div>';
+  }
+
+  function errorBlock(message) {
+    view.innerHTML = '<div class="wrap"><div class="result err"><div class="mark">⚠️</div><div>' +
+      '<h4>Terjadi kesalahan</h4><p>' + esc(message) + '</p>' +
+      '<p class="muted">Pastikan <code>setupDatabase()</code> sudah dijalankan dan konfigurasi ' +
+      '<code>APP_CONFIG</code> sudah benar.</p></div></div></div>';
+  }
+
+  function renderContact() {
+    var c = state.config && state.config.contact;
+    var box = document.getElementById('footerContact');
+    if (box && c) {
+      box.innerHTML = '📍 ' + esc(c.address) + '<br/>📞 ' + esc(c.phone) + '<br/>✉️ ' + esc(c.email);
+    }
+  }
+
+  /* ---------------------------- BOOTSTRAP ------------------------ */
+  document.getElementById('menuToggle').addEventListener('click', function () {
+    document.querySelector('.app-header').classList.toggle('nav-open');
+  });
+  document.querySelectorAll('#topNav a').forEach(function (a) {
+    a.addEventListener('click', function () {
+      document.querySelector('.app-header').classList.remove('nav-open');
+    });
+  });
+  document.getElementById('footerYear').textContent =
+    '© ' + new Date().getFullYear() + ' PSSDM Kelautan dan Perikanan';
+
+  // Deep-link awal dari parameter URL (?page=scan&code=…) hasil tautan QR
+  var body = document.body;
+  var initialPage = body.getAttribute('data-page') || 'home';
+  var initialSlug = body.getAttribute('data-slug') || '';
+  var initialCode = body.getAttribute('data-code') || '';
+
+  if (initialPage === 'checkin' && initialCode) {
+    location.hash = '#/scan?code=' + encodeURIComponent(initialCode);
+  } else if (initialPage === 'event' && initialSlug) {
+    location.hash = '#/event/' + initialSlug;
+  } else if (initialPage !== 'home' && !location.hash) {
+    location.hash = '#/' + initialPage;
+  }
+
+  if (!location.hash) location.hash = '#/home';
+  route();
+})();
+</script>

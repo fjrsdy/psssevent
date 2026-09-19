@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <base target="_top" />
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f3d4a" />
+  <title>SIMANEV PSSDM — Manajemen Event</title>
+  <?!= include('_Styles'); ?>
+</head>
+<body data-page="<?= page ?>" data-slug="<?= slug ?>" data-code="<?= code ?>">
+
+  <!-- ===================== HEADER ===================== -->
+  <header class="app-header">
+    <div class="wrap header-inner">
+      <a href="#/home" class="brand" data-nav="home">
+        <span class="brand-icon">🌊</span>
+        <span class="brand-text">
+          <strong>SIMANEV</strong>
+          <small>PSSDM Kelautan &amp; Perikanan</small>
+        </span>
+      </a>
+
+      <nav class="top-nav" id="topNav">
+        <a href="#/home" data-nav="home">Portal</a>
+        <a href="#/events" data-nav="events">Event</a>
+        <a href="#/register" data-nav="register">Daftar</a>
+        <a href="#/ticket" data-nav="ticket">E-Ticket</a>
+        <a href="#/scan" data-nav="scan">Scan QR</a>
+        <a href="#/dashboard" data-nav="dashboard" class="nav-admin">Dashboard</a>
+      </nav>
+
+      <button class="btn-icon" id="menuToggle" aria-label="Menu">☰</button>
+    </div>
+  </header>
+
+  <!-- ===================== KONTEN ===================== -->
+  <main id="view" class="view">
+    <div class="wrap loading-block">
+      <div class="spinner"></div>
+      <p>Memuat aplikasi…</p>
+    </div>
+  </main>
+
+  <!-- ===================== FOOTER ===================== -->
+  <footer class="app-footer">
+    <div class="wrap footer-grid">
+      <div>
+        <div class="footer-brand">🌊 SIMANEV PSSDM</div>
+        <p>Pusat Standardisasi dan Sertifikasi Sumber Daya Manusia Kelautan dan Perikanan. Portal event, pendaftaran peserta, e-ticket QR, dan check-in digital.</p>
+      </div>
+      <div>
+        <h4>Layanan</h4>
+        <a href="#/events">Daftar Event</a>
+        <a href="#/register">Pendaftaran Peserta</a>
+        <a href="#/ticket">Cek E-Ticket</a>
+        <a href="#/scan">Scan Check-in</a>
+        <a href="#/dashboard">Dashboard &amp; Laporan</a>
+      </div>
+      <div>
+        <h4>Kontak</h4>
+        <p id="footerContact">Memuat kontak…</p>
+      </div>
+    </div>
+    <div class="footer-bottom wrap">
+      <span>Dibangun dengan Google Apps Script + Google Sheets + Blogger</span>
+      <span id="footerYear"></span>
+    </div>
+  </footer>
+
+  <!-- ===================== NAVIGASI BAWAH (MOBILE) ===================== -->
+  <nav class="bottom-nav" id="bottomNav">
+    <a href="#/home" data-nav="home"><span>🏠</span><small>Portal</small></a>
+    <a href="#/events" data-nav="events"><span>📅</span><small>Event</small></a>
+    <a href="#/scan" data-nav="scan" class="nav-scan"><span>📷</span><small>Scan</small></a>
+    <a href="#/ticket" data-nav="ticket"><span>🎟️</span><small>Tiket</small></a>
+    <a href="#/dashboard" data-nav="dashboard"><span>📊</span><small>Laporan</small></a>
+  </nav>
+
+  <!-- ===================== TOAST ===================== -->
+  <div id="toast" class="toast"></div>
+
+  <?!= include('_Scripts'); ?>
+</body>
+</html>
